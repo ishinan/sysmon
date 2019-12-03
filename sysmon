@@ -1,0 +1,689 @@
+#!/bin/bash
+# File: sysmon_v09.sh
+# Author: Masaaki Yana
+# Date: 2017/03/06
+# Description:
+#    - Monitor system activities using linux utilities 
+#    - Run sysmon.sh -h for help
+#    
+# Change:
+#    - Updated strace option by adding -y (2017/03/06) 
+#
+# Plan:
+#   1. @Indexer, run "sysmon" to monitor system
+#   2. @SH, set up a post-script alert 
+#   3. alert scirpt: From SH to Indexer, when the condition to stop the script, ssh to write a file splkmon.stop
+#   4. @Indexer, the script will check the splkmon.stop file and stop the script
+#   5. @Indexer, create an archive file .tgz
+#
+#   6. Option for tcpdump only collect headers
+#
+
+#------------------------------------------------------------
+# Nick's script
+# reformat_pstack_file_to_multiple_files
+#------------------------------------------------------------
+#echo "This assumes that you break each psatck with a timestamp with date in yyyy/mm/dd format (ex 2015/12/23)"
+#if [ "$#" -ne 1 ]; then
+#	echo "usage: pstack-breaker.sh <single-pstack-file>"
+#	exit
+#fi
+#cat $1 | 
+#awk '
+#	BEGIN {
+#		i="0";
+#		filename = sprintf("pstack%d.out", i);
+#	}
+#	/[0-9]{4}\/[0-9]{2}\/[0-9]{2}/ {
+#		close(filename);
+#		i=i+1;
+#		filename=sprintf("pstack%d.out",i);
+#	}
+#	!/[0-9]{4}\/[0-9]{2}\/[0-9]{2}/ {
+#		print > filename;
+#	}
+#'
+#tar cfz pstack.tgz pstack*.out
+#rm pstack*.out
+#------------------------------------------------------------
+#
+
+
+
+#
+# Example:
+#      TBD
+#
+#
+# Update:
+#   - Updated help
+#
+#
+
+
+
+#
+# CONSTANT
+#
+
+VERSION='0.09'
+
+# GETOPT Flags
+FLAG_h=0 # Help
+FLAG_v=0 # Version
+
+FLAG_H=0 # ${SPLUNK_HOME} default: /opt/splunk
+FLAG_l=0 # ${LOOP}   How many times to run command(s) (default: 60 times)
+FLAG_s=0 # ${SLEEP}  How long to wait before running command(s) next time (default: 1 sec)
+FLAG_p=0 # ${PERIOD} How many times to override  log files (default: 2 as there are two log files)
+FLAG_Z=0 # If this option exists never stops until /tmp/splkmon/sysmon.stop file exist 
+
+FLAG_z=0 # All except for strace and tcpdump (strace cannot run with pstack together)
+
+FLAG_I=0 # Iostat
+FLAG_K=0 # pstacK 
+FLAG_L=0 # Ls 
+FLAG_M=0 # Mpstat 
+FLAG_N=0 # Netstat -an
+FLAG_O=0 # lsOf
+FLAG_P=0 # Ps 
+FLAG_T=0 # Top 
+FLAG_V=0 # Vmstat
+
+FLAG_D=0 # tcpDump Not in -z 
+FLAG_F=0 # dF      Not in -z because it is not useful
+FLAG_S=0 # Strace  Not in -z because it conflicts with pstack
+
+#
+# Script Variables
+#
+
+# Create splkmon directory under /tmp
+if [ -d /tmp/splkmon ]
+then
+    DIR_LOG="/tmp/splkmon"   
+else
+    mkdir /tmp/splkmon
+    DIR_LOG="/tmp/splkmon"   
+fi
+
+# Default Variables
+SLEEP_DFLT=1
+LOOP_DFLT=60
+PERIOD_DFLT=1
+
+hostname=`hostname`
+startdatetime=`date +%Y%m%d%H%M%S`
+
+#--- This is not used ---
+# ssh to indexer
+# Suggestion: use /root/.ssh/authorized_keys to run remote command without password
+#USERNAME="root"
+#PASSWORD="password"
+#--- This is not used ---
+
+
+#
+# Functions
+#
+
+# Usage 
+printUsage () {
+    echo "Version $VERSION"
+    echo \
+    "Usage    : $0 <-options>
+----------------------------
+sysmon.sh: system monitor script
+          - Run linux system monitor utilities for a period of time
+          - Keep writing to a log.0 or log.1 for a period of time
+Log file : /tmp/splkmon/{cmd}_{starttime}_{pid}.log.{id}
+----------------------------
+Example 1: $0  -z -H \"/opt/splunk\" 
+         => Run most of the system utilities for 1 min with 1 second sleep 
+Example 2: $0 -NT -l 30 -H \"/opt/splunk\"
+         => Run netstat and top for 30 seconds with 1 second sleep
+Example 3: $0 -PK -l 600 -Z -H \"/opt/splunk\"
+         => Run ps and pstak for 10 min until /tmp/splkmon/sysmon.stop exists
+Example 4: $0  -z -l 600  -p 4 -H \"/opt/splunk\" 
+         => Run most of the utilities for 10 min seconds four times 
+           (Total run time is 40 min, but only the latest 10-20 min will be available)
+           (Use case: Run script 1 hour and stop anytime during this period by sysmon.stop file)
+----------------------------
+    -h     (=This Usage)
+    -v     (version of this script)
+----------------------------
+General options:
+    -H: \${SPLUNK_HOME} - If not specified, look for a splunkd process, and use first found splunkd
+    -l: \${LOOP}        - How many times to run command(s) (default: 60 times)
+    -s: \${SLEEP}       - How long to wait before running command(s) next time (default: 1 sec)
+    -p: \${PERIOD}      - How many times to override log files (default: 2 as there are two log files)
+    -Z:                 - If this option exists never stops until /tmp/splkmon/sysmon.stop file exist 
+----------------------------
+Available monitor utilities:
+    -z: All except for df, strace, and tcpdump (strace cannot run with pstack together)
+    ------------------------
+    -L: find \${SPLUNK_HOME}/var/run | xargs ls -dl --time-style=+%m/%d/%YT%H:%M:%S
+    -P: ps -LC splunkd,python -o user,uid,pid,ppid,lwp,%cpu,%mem,vsz,rss,f,s,stat,wchan=WIDE-WCHAN-COLUMN,start,time,stime,cpuid,args
+    -T: top -d \${SLEEP} -bHc -n \${LOOP} 
+    -O: lsof -p ${pid}
+    -K: pstack \${pid}
+    -I: iostat -t -x -p \${SLEEP}
+    -V: vmstat \${SLEEP} 
+    -M: mpstat -P ALL \${SLEEP}
+    -N: netstat -an
+    ------------------------
+    -F: df -k                               # Not in -z because it is not useful
+    -S: strace -tttTfy -p \${pid}            # Not in -z because it conflicts with pstack
+    -D: tcpdump -i \${device} -nnvvXS -s 0  # Not in -z (device is not available in this version)
+"
+}
+
+# Not used
+# Run df
+runDf () {
+    ${cmd_df} >> ${DIR_LOG}/${hostname}_df_${startdatetime}_${pid}.log
+}
+
+# Run ls
+runLs () {
+    echo -e "\n`date +"%Y/%m/%d %H:%M:%S %z"`" >> ${DIR_LOG}/${hostname}_ls_${startdatetime}_${pid}.log.${1}
+    ${cmd_find} | ${cmd_find_xargs_ls} >> ${DIR_LOG}/${hostname}_ls_${startdatetime}_${pid}.log.${1}
+}
+
+# Run ps
+runPs () {
+    echo -e "\n`date +"%Y/%m/%d %H:%M:%S %z"`" >> ${DIR_LOG}/${hostname}_ps_${startdatetime}_${pid}.log.${1}
+    ${cmd_ps} >> ${DIR_LOG}/${hostname}_ps_${startdatetime}_${pid}.log.${1} 
+}
+
+# Run lsof
+runLsof () {
+    echo -e "\n`date +"%Y/%m/%d %H:%M:%S %z"`" >> ${DIR_LOG}/${hostname}_lsof_${startdatetime}_${pid}.log.${1} 2> /dev/null
+    ${cmd_lsof} >> ${DIR_LOG}/${hostname}_lsof_${startdatetime}_${pid}.log.${1} 2> /dev/null
+}
+
+# Run pstack
+runPstack () {
+    echo -e "\n`date +"%Y/%m/%d %H:%M:%S %z"`" >> ${DIR_LOG}/${hostname}_pstack_${startdatetime}_${pid}.log.${1}
+    ${cmd_pstack} >> ${DIR_LOG}/${hostname}_pstack_${startdatetime}_${pid}.log.${1}
+}
+
+# Run netstat
+runNetstat () {
+    echo -e "\n`date +"%Y/%m/%d %H:%M:%S %z"`" >> ${DIR_LOG}/${hostname}_netstat_${startdatetime}_${pid}.log.${1}
+    ${cmd_netstat} >> ${DIR_LOG}/${hostname}_netstat_${startdatetime}_${pid}.log.${1}
+}
+
+# Run top
+runTop () {
+    #echo "Writing to a file: ${DIR_LOG}/${hostname}_top_${startdatetime}_${pid}.log.${1}"
+    ${cmd_top}  > ${DIR_LOG}/${hostname}_top_${startdatetime}_${pid}.log.${1} 
+}
+
+# Run iostat
+runIostat () {
+    # echo "Writing to a file: ${DIR_LOG}/${hostname}_iostat_${startdatetime}_${pid}.log.${1}"
+    ${cmd_iostat}  > ${DIR_LOG}/${hostname}_iostat_${startdatetime}_${pid}.log.${1}
+}
+
+# Run vmstat
+runVmstat () {
+    #echo "Writing to a file: ${DIR_LOG}/${hostname}_vmstat_${startdatetime}_${pid}.log.${1}"
+    echo -e "\n`date +"%Y/%m/%d %H:%M:%S %z"`" > ${DIR_LOG}/${hostname}_vmstat_${startdatetime}_${pid}.log.${1}
+    ${cmd_vmstat} >> ${DIR_LOG}/${hostname}_vmstat_${startdatetime}_${pid}.log.${1} 
+}
+
+# Run mpstat
+runMpstat () {
+    #echo "Writing to a file: ${DIR_LOG}/${hostname}_mpstat_${startdatetime}_${pid}.log.${1}"
+    ${cmd_mpstat} > ${DIR_LOG}/${hostname}_mpstat_${startdatetime}_${pid}.log.${1}
+}
+
+# Run strace
+runStrace () {
+    #echo "Writing to a file: ${DIR_LOG}/${hostname}_strace_${startdatetime}_${pid}.log.${1}"
+    ${cmd_strace} -o ${DIR_LOG}/${hostname}_strace_${startdatetime}_${pid}.log.${1} 2> /dev/null
+}
+
+# Run tcpdump
+runTcpdump () {
+    ${cmd_tcpdump} -w ${DIR_LOG}/${hostname}_tcpdump_${startdatetime}_${pid}.log.${1} 2> /dev/null
+}
+
+# Run a typeA runCmd function as a loop
+runLoopTypeA () {
+    # ${1}: cmd2run
+    # runLoopTypeA runNetstat
+    runCmd=${1}
+    cmd2run=`echo ${runCmd} | grep -oP "(?<=run).*" | tr '[A-Z]' '[a-z]'`
+    
+    page=0       # File Number 0 or 1
+    num_repeat=0 # Decide how many times to write file number 1 or 2
+    while [ 0 ]
+    do
+        i=0
+        #echo "Writing to a file: ${DIR_LOG}/${hostname}_${cmd2run}_${startdatetime}_${pid}.log.${page}"
+        echo -e "Refreshing" > ${DIR_LOG}/${hostname}_${cmd2run}_${startdatetime}_${pid}.log.${page}
+        while [ ${i} -lt ${LOOP} ]
+        do
+            ${runCmd} ${page}
+            let i+=1
+            sleep ${SLEEP}
+        done
+
+        # Condition to stop this loop
+        # Basically stop when sysmon.stop exist
+        let num_repeat+=1
+        if [[ -f /tmp/splkmon/sysmon.stop || ${num_repeat} -eq ${PERIOD} ]]
+        then
+            break
+        fi
+        # Iterate file number 0 or 1
+        if [ ${page} -eq 0 ]
+        then
+            page=1
+        else
+            page=0
+        fi
+    done
+}
+
+# Run a typeB runCmd function as a loop
+runLoopTypeB () {
+    # ${1}: cmd2run
+    # runLoopTypeB runVmstat
+    runCmd=${1}
+    cmd2run=`echo ${runCmd} | grep -oP "(?<=run).*" | tr '[A-Z]' '[a-z]'`
+    
+    page=0       # File Number 0 or 1
+    num_repeat=0 # Decide how many times to write file number 1 or 2
+    while [ 0 ]
+    do
+        # For strace and tcpdump, kill it before starting to write to a new log file
+        if [[ ${cmd2run} == "strace" || ${cmd2run} == "tcpdump" ]]
+        then
+            pkill ${cmd2run}
+        fi
+
+        ${runCmd} ${page} &
+        sleep ${LOOP}
+        let num_repeat+=1
+        # Condition to stop this loop 
+        # Basically stop when sysmon.stop exist 
+        if [[ -f /tmp/splkmon/sysmon.stop || ${num_repeat} -eq ${PERIOD} ]]
+        then
+            # For strace and tcpdump, kill it before starting to write to a new log file
+            if [[ ${cmd2run} == "strace" || ${cmd2run} == "tcpdump" ]]
+            then
+                pkill ${cmd2run}
+            fi
+            break
+        fi
+        # Iterate file number 0 or 1
+        if [ ${page} -eq 0 ]
+        then
+            page=1
+        else
+            page=0
+        fi
+    done
+}
+
+
+# For future use
+# Archive the logs
+getArchive () {
+    ARRAY_LOG_FILES=( $* ) 
+    ARCH_TYPE="${ARRAY_LOG_FILES[0]}"
+    unset ARRAY_LOG_FILES[0]
+    ARRAY_LOG_FILES=( "${ARRAY_LOG_FILES[@]}" )
+    ARCHIVED_FILE="${ARCHIVED_FILE_PRE}_${ARCH_TYPE}.tgz"
+    $CMD_ARCHIVE ${ARCHIVED_FILE} ${ARRAY_LOG_FILES[@]}  2> /dev/null
+  
+    if [[ $? -eq 0 ]]
+    then
+       echo "Created  $ARCHIVED_FILE successfully."
+    else
+       if [[ -s ${ARCHIVED_FILE} ]]
+       then 
+          echo "Created to create ${ARCHIVED_FILE}..."
+       else 
+          echo "Failed to create ${ARCHIVED_FILE}."
+       fi
+    fi
+    rm -f ${ARRAY_LOG_FILES[@]}
+}
+
+# Check if a command exists
+chkCmdExists () {
+    runCmd=${1}
+    cmd2run=`echo ${runCmd} | grep -oP "(?<=run).*" | tr '[A-Z]' '[a-z]'`
+    cmd_path=`which $cmd2run 2> /dev/null`
+
+    if [[ -z ${cmd_path} ]] 
+    then
+       echo "WARN: Could not find a utility: \"$cmd2run\" - Please check if the utility is installed or a user has permission to run it."
+       exit
+    fi
+}
+
+# Check if a file specified by a user exists 
+chkFileExists () {
+    FILE=0
+    FILE=$1
+  
+    if [[ -f $FILE ]] 
+    then
+       #echo "File exists"
+       return 0
+    else
+       echo "File not found"
+       return 1
+    fi
+}
+
+
+#
+# Main
+#
+
+# Check the number of arguments  before getopt
+# Useful when any argument is expected before getopt
+if [[ $# -eq 0 ]]
+then
+    printUsage
+    allcmds=( runPstack runLs runPs runLsof runNetstat runTop \
+              runVmstat runIostat runMpstat runTcpdump \
+              runStrace )
+    for check in ${allcmds[@]} 
+    do 
+        chkCmdExists ${check}
+    done
+    exit 1
+fi
+
+# getopts optons
+while getopts hvH:l:s:p:ZzIKLMNOPTVDFS OPT
+do
+    case $OPT
+    in
+       h) FLAG_h=1 ;; # Help
+       v) FLAG_v=1 ;; # Version
+       H) FLAG_H=1 
+          ARG_H=$OPTARG ;; # SPLUNK_HOME
+       l) FLAG_l=1 
+          ARG_l=$OPTARG ;; # LOOP
+       s) FLAG_s=1 
+          ARG_s=$OPTARG ;; # SLEEP
+       p) FLAG_p=1 
+          ARG_p=$OPTARG ;; # PERIOD
+       z) FLAG_z=1      ;; # Most of commands
+       I) FLAG_I=1 ;;
+       K) FLAG_K=1 ;;
+       L) FLAG_L=1 ;;
+       M) FLAG_M=1 ;;
+       N) FLAG_N=1 ;;
+       O) FLAG_O=1 ;;
+       P) FLAG_P=1 ;;
+       T) FLAG_T=1 ;;
+       V) FLAG_V=1 ;;
+       D) FLAG_D=1 ;;
+       F) FLAG_F=1 ;;
+       S) FLAG_S=1 ;;
+       Z) FLAG_Z=1 ;;
+       \?) printUsage
+          exit ;;
+    esac
+done
+
+let SHIFTINDEX=$OPTIND-1
+shift $SHIFTINDEX
+
+# Version of this script
+if [[ $FLAG_v -eq 1 ]]
+then
+    echo "Version $VERSION"
+    exit 1
+fi
+
+# Check the number of arguments left after getopt
+# Useful when any argument is expected after getopt
+if [[ $# -ne 0 ]]
+then
+    printUsage
+    exit 1
+fi
+
+# help = usage
+if [[ $FLAG_h -eq 1 ]]
+then
+    printUsage
+    exit 1
+fi
+
+ 
+# Check SPLUNK_HOME
+if [ ${FLAG_H} -eq 1 ]
+then
+   SPLUNK_HOME=${ARG_H}
+else
+   SPLUNK_HOME=`lsof -p \`ps aux | grep -P "splunkd -p \d+" | sed -n 1p | awk '{print $2}'\` | grep -oP '\S+(?=/bin/splunkd$)'`
+   if [ -z ${SPLUNK_HOME} ] 
+   then 
+       echo "Could not identify \$SPLUNK_HOME. Is splunkd running?"
+       exit 111
+   fi
+fi
+
+
+# Find splunkd pid
+if [ -f  ${SPLUNK_HOME}/var/run/splunk/splunkd.pid ]
+then 
+    pid=`cat ${SPLUNK_HOME}/var/run/splunk/splunkd.pid | sed -n 1p`
+else
+    echo "Could not find PID of splunkd"
+    exit 999
+fi
+
+# Check LOOP
+if [ ${FLAG_l} -eq 1 ]
+then
+   LOOP=${ARG_l}
+else
+   LOOP=${LOOP_DFLT}
+fi
+
+
+# Check SLEEP
+if [ ${FLAG_s} -eq 1 ]
+then
+   SLEEP=${ARG_s}
+else
+   SLEEP=${SLEEP_DFLT}
+fi
+
+# Check PERIOD
+# -p will overwride -Z 
+if [ ${FLAG_p} -eq 1 ]
+then
+   PERIOD=${ARG_p}
+else
+   if [ ${FLAG_Z} -eq 1 ] 
+   then
+       PERIOD=43200
+   else
+       PERIOD=${PERIOD_DFLT}
+   fi
+fi
+
+
+
+# Commnad to run
+cmd_df="df -k"
+cmd_ls="ls -lR  --time-style='+[%m/%d/%Y %H:%M:%S]' ${SPLUNK_HOME}/var/run" 
+cmd_find="find ${SPLUNK_HOME}/var/run"
+cmd_find_xargs_ls="xargs ls -dl --time-style=+%m/%d/%YT%H:%M:%S"
+
+cmd_ps="ps -LC splunkd,python -o user,uid,pid,ppid,lwp,%cpu,%mem,vsz,rss,f,s,stat,wchan=WIDE-WCHAN-COLUMN,start,time,stime,cpuid,args"
+cmd_top="top -d ${SLEEP} -bHc -n ${LOOP}" 
+cmd_lsof="lsof -p ${pid}"
+cmd_strace="strace -tttTfy -p ${pid}"
+cmd_pstack="pstack ${pid}"
+cmd_iostat="iostat -t -x -p ${SLEEP} ${LOOP}"
+cmd_vmstat="vmstat ${SLEEP} ${LOOP}" 
+cmd_mpstat="mpstat -P ALL ${SLEEP} ${LOOP}"
+#cmd_netstat="netstat -an -c 1"
+cmd_netstat="netstat -an"
+cmd_tcpdump="tcpdump  -nnvvXS -s 0 "  # How should we decide device -i option?
+
+cmd_archive="/bin/tar czf"
+cmd_extract="/bin/tar zzf"
+archived_file_pre="${DIR_LOG}/SN${SNUM}_`date +"%Y%m%d_%H%M"`"
+
+
+# First Print-out
+echo "`date`"
+sleep 1;
+ echo -e " ---------------------------------------------------------------------------"
+echo -e " Logs: ${DIR_LOG}/${hostname}_<cmd>_<starttime>_<pid>.log.<page>"
+sleep 1;
+echo -e " How many times to log record in a log file      : ${LOOP}"
+sleep 1;
+echo -e " How often to try to write a record (best effort): every ${SLEEP} [second]"
+sleep 1;
+
+if [ ${FLAG_Z} -eq 1 ] 
+then
+   echo -e " How many times to repeat this to a log file(-Z) : ${PERIOD} [times] as max"
+   echo -e " ---------------------------------------------------------------------------"
+   echo -e " !!! CAUTION !!! ==>  To stop this script, 'touch  /tmp/splkmon/sysmon.stop'"
+   echo -e " ---------------------------------------------------------------------------"
+else
+   echo -e " How many times to repeat this to a log file     : ${PERIOD} [times]"
+fi
+
+if [[ $FLAG_z -eq 1 || \
+      $FLAG_T -eq 1 || \
+      $FLAG_I -eq 1 || \
+      $FLAG_L -eq 1 || \
+      $FLAG_M -eq 1 || \
+      $FLAG_O -eq 1 || \
+      $FLAG_P -eq 1 || \
+      $FLAG_V -eq 1 || \
+      $FLAG_K -eq 1 || \
+      $FLAG_D -eq 1 || \
+      $FLAG_S -eq 1 ]]
+then
+   echo "==>  Starting to monitor system and splunkd(pid: ${pid})"
+else
+   echo "==>  Not Starting. Missing options?"
+   exit
+fi
+
+
+# Most of commands
+if [[ $FLAG_z -eq 1 ]]
+then
+    # LoopTypeA: Run periodically by this script
+    array_cmdTypeA=( runPstack runLs runPs runLsof runNetstat )
+    # LoopTypeB: Run periodically by a command's option itself
+    array_cmdTypeB=( runTop runVmstat runIostat runMpstat runTcpdump )
+   
+    cmds=( ${array_cmdTypeA[@]} ${array_cmdTypeB[@]} )  
+    for check in ${cmds[@]} 
+    do 
+        chkCmdExists ${check}
+    done
+
+    # Run TypeA commands
+    for cmd2loop in ${array_cmdTypeA[@]}
+    do 
+        runLoopTypeA ${cmd2loop} &
+    done
+
+    # Run TypeB commands
+    for cmd2loop in ${array_cmdTypeB[@]}
+    do 
+        runLoopTypeB ${cmd2loop} &
+    done
+else
+    # top
+    if [[ $FLAG_T -eq 1 ]]
+    then
+        chkCmdExists runTop
+        runLoopTypeB runTop &
+    fi
+
+    # iostat
+    if [[ $FLAG_I -eq 1 ]]
+    then
+        chkCmdExists runIostat
+        runLoopTypeB runIostat &
+    fi
+
+    # ls
+    if [[ $FLAG_L -eq 1 ]]
+    then
+        chkCmdExists runLs
+        runLoopTypeA runLs &
+    fi
+
+    # mpstat
+    if [[ $FLAG_M -eq 1 ]]
+    then
+        chkCmdExists runMpstat
+        runLoopTypeB runMpstat &
+    fi
+
+    # lsOf
+    if [[ $FLAG_O -eq 1 ]]
+    then
+        chkCmdExists runLsof
+        runLoopTypeA runLsof &
+    fi
+
+    # Netstat
+    if [[ $FLAG_N -eq 1 ]]
+    then
+        chkCmdExists runNetstat
+        runLoopTypeA runNetstat &
+    fi
+
+    # ps
+    if [[ $FLAG_P -eq 1 ]]
+    then
+        chkCmdExists runPs
+        runLoopTypeA runPs &
+    fi
+
+    # vmstat
+    if [[ $FLAG_V -eq 1 ]]
+    then
+        chkCmdExists runVmstat
+        runLoopTypeB runVmstat &
+    fi
+
+
+    # pstack
+    if [[ $FLAG_K -eq 1 ]]
+    then
+        chkCmdExists runPstack
+        runLoopTypeA runPstack &
+    fi
+
+    # tcpdump
+    # Should give a set of options as arguement
+    if [[ $FLAG_D -eq 1 ]]
+    then
+        chkCmdExists runTcpdump
+        runLoopTypeB runTcpdump &
+    fi
+
+    # strace
+    if [[ $FLAG_S -eq 1 ]]
+    then
+        chkCmdExists runStrace
+        runLoopTypeB runStrace &
+    fi
+fi
+
